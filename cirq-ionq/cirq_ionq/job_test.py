@@ -459,8 +459,8 @@ def test_job_fields_update_status():
 
 
 def test_shotwise_job_results_ideal_simulator():
+    # Ideal simulator should skip the shots fetch and resample probabilities.
     mock_client = mock.MagicMock()
-    mock_client.get_shots.return_value = [1, 1, 1, 1, 1]
     mock_client.get_results.return_value = {'0': '1'}
     job_dict = {
         'id': 'my_id',
@@ -471,19 +471,20 @@ def test_shotwise_job_results_ideal_simulator():
             'shots': '5',
             'measurements': json.dumps([{'measurement0': f'results{chr(31)}0,1'}]),
         },
-        'results': {'shots': {'url': 'http://fake.url/shots'}},
+        'results': {'shots': {'url': '/v0.4/jobs/my_id/results/shots'}},
         "noise": {"model": "ideal"},
     }
     job = ionq.Job(mock_client, job_dict)
     result = job.results()
     cirq_result = result.to_cirq_result()
     assert cirq_result.measurements["results"].tolist() == [[0, 0], [0, 0], [0, 0], [0, 0], [0, 0]]
+    mock_client.get_shots.assert_not_called()
 
 
 def test_shotwise_job_results_noisy_simulator():
     mock_client = mock.MagicMock()
     mock_client.get_results.return_value = {'0': '0.6', '1': '0.4'}
-    mock_client.get_shots.return_value = [2, 1, 3, 1, 0]
+    mock_client.get_shots.return_value = ['2', '1', '3', '1', '0']
     job_dict = {
         'id': 'my_id',
         'status': 'completed',
@@ -493,7 +494,7 @@ def test_shotwise_job_results_noisy_simulator():
             'shots': '5',
             'measurements': json.dumps([{'measurement0': f'results{chr(31)}0,1'}]),
         },
-        'results': {'shots': {'url': 'http://fake.url/shots'}},
+        'results': {'shots': {'url': '/v0.4/jobs/my_id/results/shots'}},
         "noise": {"model": "aria-1"},
     }
     job = ionq.Job(mock_client, job_dict)
@@ -505,7 +506,7 @@ def test_shotwise_job_results_noisy_simulator():
 def test_shotwise_job_results_qpu():
     mock_client = mock.MagicMock()
     mock_client.get_results.return_value = {'0': '0.6', '3': '0.4'}
-    mock_client.get_shots.return_value = [2, 1, 3, 1, 0]
+    mock_client.get_shots.return_value = ['2', '1', '3', '1', '0']
     job_dict = {
         'id': 'my_id',
         'status': 'completed',
@@ -515,9 +516,105 @@ def test_shotwise_job_results_qpu():
             'shots': 5,
             'measurements': json.dumps([{'measurement0': f'results{chr(31)}0,1'}]),
         },
-        'results': {'shots': {'url': 'http://fake.url/shots'}},
+        'results': {'shots': {'url': '/v0.4/jobs/my_id/results/shots'}},
     }
     job = ionq.Job(mock_client, job_dict)
     result = job.results()
     cirq_result = result.to_cirq_result()
     assert cirq_result.measurements["results"].tolist() == [[0, 1], [1, 0], [1, 1], [1, 0], [0, 0]]
+
+
+def test_shotwise_partial_qubit_measurement():
+    # Measurement key spans qubits [0, 2] only. Shots are little-endian:
+    # '5'=0b101 -> q0=1,q2=1; '6'=0b110 -> q0=0,q2=1; '1'=0b001 -> q0=1,q2=0;
+    # '4'=0b100 -> q0=0,q2=1.
+    mock_client = mock.MagicMock()
+    mock_client.get_results.return_value = {'5': '0.5', '6': '0.5'}
+    mock_client.get_shots.return_value = ['5', '6', '1', '4']
+    job_dict = {
+        'id': 'my_id',
+        'status': 'completed',
+        'stats': {'qubits': '3'},
+        'backend': 'qpu',
+        'metadata': {
+            'shots': 4,
+            'measurements': json.dumps([{'measurement0': f'partial{chr(31)}0,2'}]),
+        },
+        'results': {'shots': {'url': '/v0.4/jobs/my_id/results/shots'}},
+    }
+    job = ionq.Job(mock_client, job_dict)
+    result = job.results()
+    cirq_result = result.to_cirq_result()
+    assert cirq_result.measurements["partial"].tolist() == [[1, 1], [0, 1], [1, 0], [0, 1]]
+
+
+def test_shotwise_missing_url_falls_back():
+    # Jobs without results.shots.url must fall back, not raise.
+    mock_client = mock.MagicMock()
+    mock_client.get_results.return_value = {'0': '1'}
+    job_dict = {
+        'id': 'my_id',
+        'status': 'completed',
+        'stats': {'qubits': '2'},
+        'backend': 'qpu',
+        'metadata': {
+            'shots': 3,
+            'measurements': json.dumps([{'measurement0': f'results{chr(31)}0,1'}]),
+        },
+        'results': {'probabilities': {'url': '/v0.4/jobs/my_id/results/probabilities'}},
+    }
+    job = ionq.Job(mock_client, job_dict)
+    result = job.results()
+    cirq_result = result.to_cirq_result()
+    assert cirq_result.measurements["results"].tolist() == [[0, 0], [0, 0], [0, 0]]
+    mock_client.get_shots.assert_not_called()
+
+
+def test_shotwise_fetch_failure_warns_and_falls_back():
+    from cirq_ionq import ionq_exceptions
+
+    mock_client = mock.MagicMock()
+    mock_client.get_shots.side_effect = ionq_exceptions.IonQException("boom")
+    mock_client.get_results.return_value = {'0': '1'}
+    job_dict = {
+        'id': 'my_id',
+        'status': 'completed',
+        'stats': {'qubits': '2'},
+        'backend': 'qpu',
+        'metadata': {
+            'shots': 3,
+            'measurements': json.dumps([{'measurement0': f'results{chr(31)}0,1'}]),
+        },
+        'results': {'shots': {'url': '/v0.4/jobs/my_id/results/shots'}},
+    }
+    job = ionq.Job(mock_client, job_dict)
+    with pytest.warns(UserWarning, match="shotwise output"):
+        result = job.results()
+    cirq_result = result.to_cirq_result()
+    assert cirq_result.measurements["results"].tolist() == [[0, 0], [0, 0], [0, 0]]
+
+
+def test_shotwise_skipped_when_sharpen_set():
+    # `sharpen` aggregates across debiasing variants and is mutually exclusive
+    # with raw per-shot data. When the caller asks for sharpening, skip the
+    # extra shots fetch entirely.
+    mock_client = mock.MagicMock()
+    mock_client.get_results.return_value = {'0': '0.6', '3': '0.4'}
+    job_dict = {
+        'id': 'my_id',
+        'status': 'completed',
+        'stats': {'qubits': '2'},
+        'backend': 'qpu',
+        'metadata': {
+            'shots': 5,
+            'measurements': json.dumps([{'measurement0': f'results{chr(31)}0,1'}]),
+        },
+        'results': {'shots': {'url': '/v0.4/jobs/my_id/results/shots'}},
+    }
+    job = ionq.Job(mock_client, job_dict)
+    result = job.results(sharpen=True)
+    mock_client.get_shots.assert_not_called()
+    mock_client.get_results.assert_called_once_with(
+        job_id='my_id', sharpen=True, extra_query_params=None
+    )
+    assert result.shotwise_results() is None

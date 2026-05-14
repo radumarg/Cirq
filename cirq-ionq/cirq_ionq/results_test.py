@@ -29,7 +29,26 @@ def test_qpu_result_fields():
     assert result.repetitions() == 20
     assert result.num_qubits() == 1
     assert result.measurement_dict() == {'a': [0]}
-    assert result._shotwise_results == [1, 2, 3]
+    assert result.shotwise_results() == [1, 2, 3]
+
+
+def test_qpu_result_shotwise_default_none():
+    result = ionq.QPUResult({0: 10, 1: 10}, num_qubits=1, measurement_dict={'a': [0]})
+    assert result.shotwise_results() is None
+
+
+def test_qpu_result_eq_shotwise():
+    # Two results with identical counts but different shotwise data should
+    # not compare equal; shots are part of the observed state.
+    base_kwargs = {'counts': {0: 10, 1: 10}, 'num_qubits': 1, 'measurement_dict': {'a': [0]}}
+    equals_tester = cirq.testing.EqualsTester()
+    equals_tester.add_equality_group(ionq.QPUResult(**base_kwargs))
+    equals_tester.add_equality_group(
+        ionq.QPUResult(**base_kwargs, shotwise_results=[0, 1]),
+        # Decimal-string and int wire formats normalize to equal.
+        ionq.QPUResult(**base_kwargs, shotwise_results=['0', '1']),
+    )
+    equals_tester.add_equality_group(ionq.QPUResult(**base_kwargs, shotwise_results=[1, 0]))
 
 
 def test_qpu_result_str():
@@ -173,7 +192,66 @@ def test_simulator_result_fields():
     assert result.num_qubits() == 1
     assert result.measurement_dict() == {'a': [0]}
     assert result.repetitions() == 100
-    assert result._shotwise_results == [1, 2, 3]
+    assert result.shotwise_results() == [1, 2, 3]
+
+
+def test_simulator_result_shotwise_default_none():
+    result = ionq.SimulatorResult(
+        {0: 0.5, 1: 0.5}, num_qubits=1, measurement_dict={'a': [0]}, repetitions=100
+    )
+    assert result.shotwise_results() is None
+
+
+def test_simulator_result_eq_shotwise():
+    base_kwargs = {
+        'probabilities': {0: 0.5, 1: 0.5},
+        'num_qubits': 1,
+        'measurement_dict': {'a': [0]},
+        'repetitions': 100,
+    }
+    equals_tester = cirq.testing.EqualsTester()
+    equals_tester.add_equality_group(ionq.SimulatorResult(**base_kwargs))
+    equals_tester.add_equality_group(
+        ionq.SimulatorResult(**base_kwargs, shotwise_results=[0, 1]),
+        ionq.SimulatorResult(**base_kwargs, shotwise_results=['0', '1']),
+    )
+    equals_tester.add_equality_group(ionq.SimulatorResult(**base_kwargs, shotwise_results=[1, 0]))
+
+
+def test_simulator_result_to_cirq_result_shotwise():
+    # When shotwise data is present, to_cirq_result is deterministic and
+    # `seed` is ignored.
+    result = ionq.SimulatorResult(
+        {0b00: 0.5, 0b01: 0.5},
+        num_qubits=2,
+        measurement_dict={'x': [0, 1]},
+        repetitions=3,
+        shotwise_results=['1', '2', '3'],
+    )
+    # Little-endian: 1 -> q0=1,q1=0 -> [1,0]; 2 -> q0=0,q1=1 -> [0,1]; 3 -> q0=1,q1=1 -> [1,1]
+    expected = np.array([[1, 0], [0, 1], [1, 1]])
+    assert np.array_equal(result.to_cirq_result().measurements['x'], expected)
+    # Same outcome regardless of seed.
+    assert np.array_equal(result.to_cirq_result(seed=7).measurements['x'], expected)
+    assert np.array_equal(result.to_cirq_result(seed=99).measurements['x'], expected)
+
+
+def test_simulator_result_override_repetitions_forces_resampling():
+    # Even with shotwise data, override_repetitions falls back to the
+    # sampling path so the user gets exactly N samples and can control them
+    # with `seed`.
+    result = ionq.SimulatorResult(
+        {0b00: 0.25, 0b01: 0.75},
+        num_qubits=2,
+        measurement_dict={'x': [0, 1]},
+        repetitions=3,
+        shotwise_results=['1', '2', '3'],  # length 3, but user wants 2
+    )
+    sampled = result.to_cirq_result(seed=2, override_repetitions=2)
+    assert sampled.measurements['x'].shape == (2, 2)
+    # Reproducible across calls with same seed.
+    sampled2 = result.to_cirq_result(seed=2, override_repetitions=2)
+    assert np.array_equal(sampled.measurements['x'], sampled2.measurements['x'])
 
 
 def test_simulator_result_str():

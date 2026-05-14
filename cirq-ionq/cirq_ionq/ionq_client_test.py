@@ -598,18 +598,30 @@ def test_ionq_client_get_job_retry(mock_get):
 @mock.patch('requests.get')
 def test_ionq_client_get_shots(mock_get):
     mock_get.return_value.ok = True
-    mock_get.return_value.json.return_value = {'foo': 'bar'}
+    mock_get.return_value.json.return_value = ['3', '0', '0', '3']
     client = ionq.ionq_client._IonQClient(remote_host='http://example.com', api_key='to_my_heart')
     client.batch_mode = False
-    response = client.get_shots(shots_url="v0.4/results/shots/")
-    assert response == {'foo': 'bar'}
-
     expected_headers = {
         'Authorization': 'apiKey to_my_heart',
         'Content-Type': 'application/json',
         'User-Agent': client._user_agent(),
     }
-    mock_get.assert_called_with('http://example.com/v0.4/results/shots/', headers=expected_headers)
+
+    response = client.get_shots(shots_url='/v0.4/jobs/abc/results/shots')
+    assert response == ['3', '0', '0', '3']
+    mock_get.assert_called_with(
+        'http://example.com/v0.4/jobs/abc/results/shots', headers=expected_headers
+    )
+
+    client.get_shots(shots_url='v0.4/jobs/abc/results/shots')
+    mock_get.assert_called_with(
+        'http://example.com/v0.4/jobs/abc/results/shots', headers=expected_headers
+    )
+
+    client.get_shots(shots_url='https://presigned.example.com/blob?sig=xyz')
+    mock_get.assert_called_with(
+        'https://presigned.example.com/blob?sig=xyz', headers=expected_headers
+    )
 
 
 @mock.patch('requests.get')

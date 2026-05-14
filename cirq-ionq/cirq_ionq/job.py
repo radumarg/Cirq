@@ -257,17 +257,26 @@ class Job:
                 f'Job was not completed successfully. Instead had status: {self.status()}'
             )
 
+        # results.shots.url is only populated for QPU jobs and noisy-simulator
+        # jobs; ideal-simulator jobs fall through to probability resampling.
+        # Skip when `sharpen` is set: sharpen aggregates across variants, and
+        # raw per-shot data does not honor it.
         shotwise_results = None
-        retrieve_shotwise_result = self.target().startswith('qpu') or (
-            "noise" in self._job
-            and "model" in self._job["noise"]
-            and self._job["noise"]["model"] != "ideal"
+        noise_model = self._job.get("noise", {}).get("model")
+        wants_shots = sharpen is None and (
+            self.target().startswith('qpu') or (noise_model and noise_model != "ideal")
         )
-        if retrieve_shotwise_result:
-            try:
-                shotwise_results = self._client.get_shots(self._job["results"]["shots"]["url"])
-            except:
-                pass
+        if wants_shots:
+            shots_url = self._job.get("results", {}).get("shots", {}).get("url")
+            if shots_url:
+                try:
+                    shotwise_results = self._client.get_shots(shots_url)
+                except ionq_exceptions.IonQException as exc:
+                    warnings.warn(
+                        f"Failed to retrieve shotwise output ({exc}); falling back "
+                        "to probability-resampled measurements.",
+                        stacklevel=2,
+                    )
 
         backend_results = self._client.get_results(
             job_id=self.job_id(), sharpen=sharpen, extra_query_params=extra_query_params

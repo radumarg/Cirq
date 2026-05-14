@@ -253,21 +253,26 @@ class _IonQClient:
 
         return self._make_request(request, {}).json()
 
-    def get_shots(self, shots_url):
-        """Get job shotwise output from IonQ API.
+    def get_shots(self, shots_url: str) -> list:
+        """Fetch per-shot measurement outcomes for a completed job.
+
+        Follows the URL in the job's ``results.shots.url`` field. The
+        URL may be absolute or a path relative to the API host.
 
         Args:
-            shots_url: The shots URL as returned by the IonQ API.
+            shots_url: URL from the job's ``results.shots.url`` field.
 
         Returns:
-            response as a dict.
+            A list of decimal-encoded measurement integers, one per
+            shot (little-endian, qubit ``i`` at bit position ``i``).
 
         Raises:
-            IonQException: For other API call failures.
+            IonQException: For API call failures.
         """
+        full_url = urllib.parse.urljoin(self.url_base + '/', shots_url)
 
         def request():
-            return requests.get(f"{self.url_base}/{shots_url}", headers=self.headers)
+            return requests.get(full_url, headers=self.headers)
 
         return self._make_request(request, {}).json()
 

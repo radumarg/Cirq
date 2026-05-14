@@ -32,7 +32,7 @@ class QPUResult:
         counts: dict[int, int],
         num_qubits: int,
         measurement_dict: dict[str, Sequence[int]],
-        shotwise_results: list[int] | None = None,
+        shotwise_results: Sequence[int | str] | None = None,
     ):
         # We require a consistent ordering, and here we use bitvector as such.
         # OrderedDict can be removed in python 3.7, where it is part of the contract.
@@ -115,6 +115,16 @@ class QPUResult:
         """Returns a map from measurement keys to target qubit indices for this measurement."""
         return self._measurement_dict
 
+    def shotwise_results(self) -> Sequence[int | str] | None:
+        """Returns raw per-shot measurement outcomes, or `None` if unavailable.
+
+        When present, each element is a little-endian integer (qubit `i` at
+        bit position `i`) encoding one shot's measurement outcome. The value
+        is sourced from the IonQ API's `results.shots.url` endpoint and is
+        only populated for QPU jobs and noisy-simulator jobs.
+        """
+        return self._shotwise_results
+
     def to_cirq_result(self, params: cirq.ParamResolver | None = None) -> cirq.Result:
         """Returns a `cirq.Result` for these results.
 
@@ -124,6 +134,10 @@ class QPUResult:
         the order of these `cirq.Result` objects should *not* be interpreted as representing the
         order in which the circuit was repeated. Correlations between measurements keys are
         preserved.
+
+        When raw per-shot data is available (see `shotwise_results`), the
+        returned `cirq.Result` reflects the actual per-shot outcomes returned
+        by the IonQ API; otherwise it is reconstructed from aggregated counts.
 
         Args:
             params: The `cirq.ParamResolver` used to generate these results.
@@ -140,24 +154,18 @@ class QPUResult:
                 'Can convert to cirq results only if the circuit had measurement gates '
                 'with measurement keys.'
             )
-
         measurements = {}
         if self._shotwise_results is not None:
+            # Raw shots are little-endian: qubit i is at bit position i.
             for key, targets in self.measurement_dict().items():
-                bits = [
-                    list(cirq.big_endian_int_to_bits(int(x), bit_count=len(targets)))[::-1]
-                    for x in self._shotwise_results
-                ]
+                bits = [[(int(x) >> t) & 1 for t in targets] for x in self._shotwise_results]
                 measurements[key] = np.array(bits)
         else:
             for key, targets in self.measurement_dict().items():
                 qpu_results = self.ordered_results(key)
                 measurements[key] = np.array(
-                    list(
-                        cirq.big_endian_int_to_bits(x, bit_count=len(targets)) for x in qpu_results
-                    )
+                    [cirq.big_endian_int_to_bits(x, bit_count=len(targets)) for x in qpu_results]
                 )
-
         return cirq.ResultDict(params=params or cirq.ParamResolver({}), measurements=measurements)
 
     def __eq__(self, other):
@@ -168,6 +176,7 @@ class QPUResult:
             and self._num_qubits == other._num_qubits
             and self._measurement_dict == other._measurement_dict
             and self._repetitions == other._repetitions
+            and _shots_equal(self._shotwise_results, other._shotwise_results)
         )
 
     def __str__(self) -> str:
@@ -187,7 +196,7 @@ class SimulatorResult:
         num_qubits: int,
         measurement_dict: dict[str, Sequence[int]],
         repetitions: int,
-        shotwise_results: list[int] | None = None,
+        shotwise_results: Sequence[int | str] | None = None,
     ):
         self._probabilities = probabilities
         self._num_qubits = num_qubits
@@ -249,31 +258,50 @@ class SimulatorResult:
         """Returns a map from measurement keys to target qubit indices for this measurement."""
         return self._measurement_dict
 
+    def shotwise_results(self) -> Sequence[int | str] | None:
+        """Returns raw per-shot measurement outcomes, or `None` if unavailable.
+
+        When present, each element is a little-endian integer (qubit `i` at
+        bit position `i`) encoding one shot's measurement outcome. The value
+        is sourced from the IonQ API's `results.shots.url` endpoint and is
+        only populated for noisy-simulator jobs (ideal-simulator jobs do not
+        produce shot data and have `shotwise_results() is None`).
+        """
+        return self._shotwise_results
+
     def to_cirq_result(
         self,
         params: cirq.ParamResolver | None = None,
         seed: cirq.RANDOM_STATE_OR_SEED_LIKE = None,
         override_repetitions=None,
     ) -> cirq.Result:
-        """Samples from the simulation probability result, producing a `cirq.Result`.
+        """Returns a `cirq.Result` for these simulator results.
 
-        The IonQ simulator returns the probabilities of different bitstrings. This converts such
-        a representation to a randomly generated sample from the simulator. Note that it does this
-        on every subsequent call of this method, so repeated calls do not produce the same
-        `cirq.Result`s. When a job was created by the IonQ API, it had a number of repetitions and
-        this is used, unless `override_repetitions` is set here.
+        When raw per-shot data is available (`shotwise_results()` is not
+        `None`) and `override_repetitions` is not set, the result is built
+        deterministically from the actual shots returned by the IonQ API and
+        `seed` has no effect.
+
+        Otherwise, the result is generated by sampling from the probability
+        distribution returned by the simulator. Repeated calls in this mode
+        do *not* produce the same `cirq.Result`s unless a `seed` is given.
 
         Args:
             params: Any parameters which were used to generated this result.
-            seed: What to use for generating the randomness. If None, then `np.random` is used.
-                If an integer, `np.random.RandomState(seed) is used. Otherwise if another
-                randomness generator is used, it will be used.
-            override_repetitions: Repetitions were supplied when the IonQ API ran the simulation,
-                but different repetitions can be supplied here and will override.
+            seed: What to use for generating the randomness on the sampling
+                path. If `None`, then `np.random` is used. If an integer,
+                `np.random.RandomState(seed)` is used. Ignored when raw
+                shots are being used (see above).
+            override_repetitions: Repetitions were supplied when the IonQ API
+                ran the simulation, but different repetitions can be supplied
+                here and will override. Setting this forces the sampling path
+                even when raw shots are available, since shot data has a
+                fixed length set by the original job.
 
         Returns:
-            A `cirq.Result` corresponding to a sample from the probability distribution returned
-            from the simulator.
+            A `cirq.Result` corresponding to either the actual per-shot
+            outcomes returned by the simulator or a sample from the
+            probability distribution.
 
         Raises:
             ValueError: If the circuit used to produce this result had no measurement gates
@@ -285,23 +313,24 @@ class SimulatorResult:
                 'with measurement keys.'
             )
 
+        # override_repetitions historically controls output size by
+        # resampling probabilities. Preserve that contract even when raw
+        # shots are available; the user is explicitly asking for N samples.
+        use_shotwise = self._shotwise_results is not None and override_repetitions is None
+
         measurements = {}
-        if self._shotwise_results is not None:
+        if use_shotwise:
             for key, targets in self.measurement_dict().items():
-                bits = [
-                    list(cirq.big_endian_int_to_bits(int(x), bit_count=len(targets)))[::-1]
-                    for x in self._shotwise_results
-                ]
+                bits = [[(int(x) >> t) & 1 for t in targets] for x in self._shotwise_results]
                 measurements[key] = np.array(bits)
         else:
             rand = cirq.value.parse_random_state(seed)
-            values, weights = zip(*list(self.probabilities().items()))
+            values, weights = zip(*self.probabilities().items())
             # normalize weights to sum to 1 if within tolerance because
             # IonQ's pauliexp gates results are not extremely precise
             total = sum(weights)
             if np.isclose(total, 1.0, rtol=0, atol=1e-5):
                 weights = tuple(w / total for w in weights)
-
             indices = rand.choice(
                 range(len(values)), p=weights, size=override_repetitions or self.repetitions()
             )
@@ -322,10 +351,25 @@ class SimulatorResult:
             and self._num_qubits == other._num_qubits
             and self._measurement_dict == other._measurement_dict
             and self._repetitions == other._repetitions
+            and _shots_equal(self._shotwise_results, other._shotwise_results)
         )
 
     def __str__(self) -> str:
         return _pretty_str_dict(self._probabilities, self._num_qubits)
+
+
+def _shots_equal(a: Sequence[int | str] | None, b: Sequence[int | str] | None) -> bool:
+    """Compare two shotwise sequences treating `None` and missing as distinct.
+
+    Decimal-string and int shots from the API are normalized to int for the
+    comparison so that a `list[str]` from the wire and a `list[int]` built
+    locally compare equal when they encode the same outcomes.
+    """
+    if a is None or b is None:
+        return a is None and b is None
+    if len(a) != len(b):
+        return False
+    return all(int(x) == int(y) for x, y in zip(a, b))
 
 
 def _pretty_str_dict(value: dict, bit_count: int) -> str:
